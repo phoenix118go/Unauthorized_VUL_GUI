@@ -153,6 +153,12 @@ class VulnerabilityScanner :
             "thinkadmin" : 80
         }
 
+        # 非HTTP协议服务列表
+        self.NON_HTTP_SERVICES = {
+            "smb", "ftp", "redis", "zookeeper", "mongodb", "ldap",
+            "vnc", "memcached", "nfs", "dubbo", "rsync", "uwsgi"
+        }
+
     # ---------------------- 检测方法（含速率优化） ----------------------
     def check_ftp(self, target_info) :
         host = target_info["host"]
@@ -192,7 +198,7 @@ class VulnerabilityScanner :
         try :
             response = self.session.get(url, timeout=self.timeout)
             if response.status_code == 200 and "ApiVersion" in response.text :
-                return True, "Docker unauthorized access"
+                return True, f"Docker unauthorized access"
         except Exception as e :
             return False, f"Docker detection failed: {str(e)}"
         return False, "Docker unauthorized access not found"
@@ -440,7 +446,6 @@ class VulnerabilityScanner :
 
         return False, "Druid unauthorized access not found"
 
-    # 以下是新增的检测函数
     def check_ldap(self, target_info):
         """检测LDAP未授权访问"""
         host = target_info["host"]
@@ -739,16 +744,27 @@ class VulnerabilityScanner :
         return False, "ThinkAdmin unauthorized access not found"
 
     def scan_single_service(self, target_info, service_name, custom_ports=None) :
-        # 优先使用用户自定义端口，其次默认端口（完全忽略目标原始端口）
-        port = custom_ports.get(service_name) if custom_ports else None
-        if not port :
-            port = self.default_ports.get(service_name)
-        if not port :
-            return False, f"服务{service_name}无默认端口配置"
+        # 优先使用用户自定义端口，其次默认端口
+        # 1. 获取用户输入的目标端口（URL中自带的端口）
+        user_input_port = target_info.get("port")
 
-        # 强制覆盖为服务端口，彻底忽略目标原始端口
+        # 2. 获取服务自定义端口（表格中用户设置的端口）
+        custom_port = custom_ports.get(service_name) if custom_ports else None
+
+        # 3. 确定最终使用的端口：用户输入端口优先，其次是自定义端口，最后是默认端口
+        if user_input_port is not None :  # 优先使用用户输入的目标端口
+            port = user_input_port
+        elif custom_port is not None :  # 其次使用服务自定义端口
+            port = custom_port
+        else :  # 最后使用服务默认端口
+            port = self.default_ports.get(service_name)
+
+        if not port :
+            return False, f"服务{service_name}无可用端口（用户未输入端口且无默认配置）"
+
+        # 使用最终确定的端口
         service_target = target_info.copy()
-        service_target["port"] = port  # 移除or逻辑，直接赋值服务端口
+        service_target["port"] = port
 
         detector = self.detectors.get(service_name)
         if not detector :
@@ -765,14 +781,26 @@ class VulnerabilityScanner :
     def get_display_url(self, target_info, service_name, custom_ports=None) :
         """生成显示用的URL，包含服务实际扫描的端口"""
         # 获取实际使用的端口（自定义端口优先，其次默认端口）
-        port = custom_ports.get(service_name) if custom_ports else None
-        if not port :
+        user_input_port = target_info.get("port")
+        custom_port = custom_ports.get(service_name) if custom_ports else None
+
+        if user_input_port is not None :
+            port = user_input_port
+        elif custom_port is not None :
+            port = custom_port
+        else :
             port = self.default_ports.get(service_name)
 
-        # 构建显示用URL
-        scheme = target_info["scheme"]
-        host = target_info["host"]
-        return f"{scheme}://{host}:{port}"
+        if not port :
+            return f"{target_info['host']} (端口未知)"
+
+        # 非HTTP服务：仅返回 host:port
+        if service_name in self.NON_HTTP_SERVICES :
+            return f"{target_info['host']}:{port}"
+        # HTTP服务：返回 scheme://host:port
+        else :
+            scheme = target_info["scheme"] or "http"
+            return f"{scheme}://{target_info['host']}:{port}"
 
 
 class ScanThread(QThread):
@@ -836,8 +864,12 @@ class ScanThread(QThread):
                     # 解析原始目标的host和scheme
                     parsed = urlparse(target_url)
                     # 重构显示用的URL（使用服务端口）
-                    display_url = f"{parsed.scheme}://{parsed.hostname}:{actual_port}"
-                    # 发射信号时使用重构的URL（只发射一次）
+                    display_url = self.scanner.get_display_url(
+                        target_info=future.target,
+                        service_name=service,
+                        custom_ports=self.custom_ports
+                    )
+                    # 发射信号时使用重构的URL
                     self.service_result.emit(display_url, service, status, message)
                     # 记录结果
                     target_results[target_url]["vulnerabilities"].append({
